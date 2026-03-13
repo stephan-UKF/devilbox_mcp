@@ -13,6 +13,8 @@ This tool runs a shell command via `docker compose exec` inside the Devilbox `ph
 - `php artisan about`
 - `vendor/bin/phpunit`
 
+The server uses `spawn` instead of `exec`, which makes it more reliable for longer-running commands and commands with a lot of output, such as `npm run build`.
+
 ## What This MCP Does
 
 The server:
@@ -61,6 +63,7 @@ Relevant variables:
 - `MCP_BIND_HOST`: bind host, default `127.0.0.1`
 - `DEVILBOX_DIR`: host path to the Devilbox installation
 - `DEVILBOX_PROJECTS_DIR`: base project path inside the `php` container, default `/shared/httpd`
+- `DEVILBOX_EXEC_TIMEOUT_MS`: command timeout in milliseconds, default `600000` (10 minutes), set to `0` to disable
 - `MCP_AUTH_TOKEN`: bearer token required for `tools/list` and `tools/call`
 
 Example:
@@ -70,6 +73,7 @@ PORT=8787
 MCP_BIND_HOST=127.0.0.1
 DEVILBOX_DIR=../devilbox_community
 DEVILBOX_PROJECTS_DIR=/shared/httpd
+DEVILBOX_EXEC_TIMEOUT_MS=600000
 MCP_AUTH_TOKEN=replace_with_a_secure_token
 ```
 
@@ -221,7 +225,7 @@ Example:
 - only one tool is currently exposed
 - the server binds to localhost by default
 - commands run inside the `php` container, not on the host
-- tool calls currently use a 60 second timeout
+- tool calls use the timeout configured in `DEVILBOX_EXEC_TIMEOUT_MS`
 - commands are passed through `bash -lc`, so `cmd` should be treated as trusted input only
 - `resources/list` and `resources/templates/list` currently return empty lists
 

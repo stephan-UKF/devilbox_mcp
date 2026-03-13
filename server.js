@@ -1,12 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { exec } = require('child_process');
-const util = require('util');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-
-const execPromise = util.promisify(exec);
 
 const loadDotEnv = (envPath) => {
     if (!fs.existsSync(envPath)) {
@@ -54,6 +51,7 @@ const HOST = getConfigValue('MCP_BIND_HOST', '127.0.0.1');
 const DEVILBOX_DIR = getConfigValue('DEVILBOX_DIR', path.resolve(process.cwd(), '../devilbox_community'));
 const PROJECTS_BASE_DIR = normalizeContainerPath(getConfigValue('DEVILBOX_PROJECTS_DIR', '/shared/httpd'));
 const EXPECTED_TOKEN = getConfigValue('MCP_AUTH_TOKEN', 'dein_super_geheimer_token_2026_xyz123_abcdef987654321');
+const EXEC_TIMEOUT_MS = Number(getConfigValue('DEVILBOX_EXEC_TIMEOUT_MS', 600000));
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
@@ -130,6 +128,73 @@ const makeToolResult = ({ command, containerWorkdir, stdout = '', stderr = '', e
         isError: exitCode !== 0
     };
 };
+
+const runInPhpContainer = ({ cmd, containerWorkdir }) => new Promise((resolve) => {
+    const child = spawn(
+        'docker',
+        ['compose', 'exec', '-T', '-w', containerWorkdir, 'php', 'bash', '-lc', cmd],
+        {
+            cwd: DEVILBOX_DIR,
+            stdio: ['ignore', 'pipe', 'pipe']
+        }
+    );
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let killTimer = null;
+
+    child.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+    });
+
+    child.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+        if (killTimer) {
+            clearTimeout(killTimer);
+        }
+
+        resolve({
+            stdout,
+            stderr: `${stderr}${stderr ? '\n' : ''}${error.message}`,
+            exitCode: 1,
+            timedOut: false
+        });
+    });
+
+    if (EXEC_TIMEOUT_MS > 0) {
+        killTimer = setTimeout(() => {
+            timedOut = true;
+            stderr += `${stderr ? '\n' : ''}Command exceeded timeout of ${EXEC_TIMEOUT_MS} ms.`;
+            child.kill('SIGTERM');
+
+            setTimeout(() => {
+                if (!child.killed) {
+                    child.kill('SIGKILL');
+                }
+            }, 5000);
+        }, EXEC_TIMEOUT_MS);
+    }
+
+    child.on('close', (code, signal) => {
+        if (killTimer) {
+            clearTimeout(killTimer);
+        }
+
+        const exitCode = timedOut ? 124 : (code ?? 1);
+        const signalSuffix = signal ? `${stderr ? '\n' : ''}Process terminated by signal ${signal}.` : '';
+
+        resolve({
+            stdout,
+            stderr: `${stderr}${signalSuffix}`,
+            exitCode,
+            timedOut
+        });
+    });
+});
 
 const resolveContainerWorkdir = (project) => {
     const normalizedProject = normalizeContainerPath(project.trim());
@@ -253,33 +318,17 @@ const handleMcpRequest = (req, res) => {
 
         console.log(`Executing in devilbox ${DEVILBOX_DIR}, workdir ${containerWorkdir} (host hint: ${projectDir}): ${cmd}`);
 
-        execPromise(
-            `cd "${DEVILBOX_DIR}" && docker compose exec -T -w "${containerWorkdir}" php bash -lc "${cmd.replace(/"/g, '\\"')}" 2>&1`,
-            { timeout: 60000 }
-        )
-            .then(({ stdout, stderr }) => {
+        runInPhpContainer({ cmd, containerWorkdir })
+            .then(({ stdout, stderr, exitCode, timedOut }) => {
                 sendMcpResponse(req, res, {
                     jsonrpc: '2.0',
                     id,
                     result: makeToolResult({
                         command: cmd,
                         containerWorkdir,
-                        stdout: stdout + (stderr || ''),
-                        stderr: '',
-                        exitCode: 0
-                    })
-                });
-            })
-            .catch((err) => {
-                sendMcpResponse(req, res, {
-                    jsonrpc: '2.0',
-                    id,
-                    result: makeToolResult({
-                        command: cmd,
-                        containerWorkdir,
-                        stdout: err.stdout || '',
-                        stderr: err.stderr || err.message || err.toString(),
-                        exitCode: err.code || 1
+                        stdout,
+                        stderr: timedOut ? `${stderr}${stderr ? '\n' : ''}The command timed out.` : stderr,
+                        exitCode
                     })
                 });
             });
@@ -297,6 +346,7 @@ app.listen(PORT, HOST, () => {
     console.log(`MCP Streamable HTTP Server running on http://${HOST}:${PORT}`);
     console.log(`Token: ${EXPECTED_TOKEN}`);
     console.log(`Projects base dir: ${PROJECTS_BASE_DIR}`);
+    console.log(`Exec timeout: ${EXEC_TIMEOUT_MS > 0 ? `${EXEC_TIMEOUT_MS} ms` : 'disabled'}`);
 });
 
 app.post(['/', '/mcp'], handleMcpRequest);
