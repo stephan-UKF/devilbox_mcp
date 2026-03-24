@@ -170,6 +170,59 @@ const sendMcpResponse = (req, res, payload, status = 200) => {
     res.status(status).json(payload);
 };
 
+const logServer = (message) => {
+    console.error(message);
+};
+
+const writeConsoleStream = (stream, chunk) => {
+    stream.write(chunk);
+};
+
+const DEVILBOX_BANNER_REGEX = /^\s*-{20,}\r?\n[\s\S]*?https?:\/\/devilbox\.org[\s\S]*?\r?\n-{20,}\r?\n*/i;
+
+const stripLeadingDevilboxBanner = (value) => {
+    if (typeof value !== 'string' || !value) {
+        return value;
+    }
+
+    let sanitized = value;
+    let removedBanner = false;
+
+    while (true) {
+        const nextValue = sanitized.replace(DEVILBOX_BANNER_REGEX, '');
+
+        if (nextValue === sanitized) {
+            break;
+        }
+
+        sanitized = nextValue.replace(/^(?:\r?\n)+/, '');
+        removedBanner = true;
+    }
+
+    return removedBanner ? sanitized : value;
+};
+
+const sanitizeContainerStreams = ({ service, stdout = '', stderr = '' }) => {
+    if (service !== 'php') {
+        return { stdout, stderr };
+    }
+
+    return {
+        stdout: stripLeadingDevilboxBanner(stdout),
+        stderr: stripLeadingDevilboxBanner(stderr)
+    };
+};
+
+const emitContainerConsoleOutput = ({ stdout = '', stderr = '' }) => {
+    if (stdout) {
+        writeConsoleStream(process.stdout, stdout);
+    }
+
+    if (stderr) {
+        writeConsoleStream(process.stderr, stderr);
+    }
+};
+
 const makeToolResult = ({ command, containerWorkdir, service, stdout = '', stderr = '', exitCode = 0, extraStructuredContent = {} }) => {
     const structuredContent = {
         command,
@@ -222,23 +275,59 @@ const runInContainer = ({ service, cmd, containerWorkdir = '/' }) => new Promise
     let stderr = '';
     let timedOut = false;
     let killTimer = null;
+    let finished = false;
 
-    child.stdout.on('data', (chunk) => {
-        stdout += chunk.toString();
-    });
+    const finalize = ({ finalStdout = stdout, finalStderr = stderr, exitCode = 1, timedOut: didTimeOut = false }) => {
+        if (finished) {
+            return;
+        }
 
-    child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString();
-    });
+        finished = true;
 
-    child.on('error', (error) => {
         if (killTimer) {
             clearTimeout(killTimer);
         }
 
+        const sanitizedStreams = sanitizeContainerStreams({
+            service,
+            stdout: finalStdout,
+            stderr: finalStderr
+        });
+
+        if (service === 'php') {
+            emitContainerConsoleOutput(sanitizedStreams);
+        }
+
         resolve({
-            stdout,
-            stderr: `${stderr}${stderr ? '\n' : ''}${error.message}`,
+            stdout: sanitizedStreams.stdout,
+            stderr: sanitizedStreams.stderr,
+            exitCode,
+            timedOut: didTimeOut
+        });
+    };
+
+    child.stdout.on('data', (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+
+        if (service !== 'php') {
+            writeConsoleStream(process.stdout, text);
+        }
+    });
+
+    child.stderr.on('data', (chunk) => {
+        const text = chunk.toString();
+        stderr += text;
+
+        if (service !== 'php') {
+            writeConsoleStream(process.stderr, text);
+        }
+    });
+
+    child.on('error', (error) => {
+        finalize({
+            finalStdout: stdout,
+            finalStderr: `${stderr}${stderr ? '\n' : ''}${error.message}`,
             exitCode: 1,
             timedOut: false
         });
@@ -259,16 +348,12 @@ const runInContainer = ({ service, cmd, containerWorkdir = '/' }) => new Promise
     }
 
     child.on('close', (code, signal) => {
-        if (killTimer) {
-            clearTimeout(killTimer);
-        }
-
         const exitCode = timedOut ? 124 : (code ?? 1);
         const signalSuffix = signal ? `${stderr ? '\n' : ''}Process terminated by signal ${signal}.` : '';
 
-        resolve({
-            stdout,
-            stderr: `${stderr}${signalSuffix}`,
+        finalize({
+            finalStdout: stdout,
+            finalStderr: `${stderr}${signalSuffix}`,
             exitCode,
             timedOut
         });
@@ -592,7 +677,7 @@ const handleMcpRequest = (req, res) => {
 
             const containerWorkdir = resolveContainerWorkdir(projectDir);
 
-            console.log(`Executing in devilbox ${DEVILBOX_DIR}, service php, workdir ${containerWorkdir} (host hint: ${projectDir}): ${cmd}`);
+            logServer(`Executing in devilbox ${DEVILBOX_DIR}, service php, workdir ${containerWorkdir} (host hint: ${projectDir}): ${cmd}`);
 
             runInContainer({
                 service: 'php',
@@ -669,7 +754,7 @@ const handleMcpRequest = (req, res) => {
                         ? buildMariadbCommand({ query, database })
                         : buildPostgresCommand({ query, database });
 
-                    console.log(`Executing read-only SQL in devilbox ${DEVILBOX_DIR}, service ${service}, database ${database || '<default>'}: ${query}`);
+                    logServer(`Executing read-only SQL in devilbox ${DEVILBOX_DIR}, service ${service}, database ${database || '<default>'}: ${query}`);
 
                     return runInContainer({
                         service,
@@ -719,12 +804,12 @@ const handleMcpRequest = (req, res) => {
 };
 
 app.listen(PORT, HOST, () => {
-    console.log(`MCP Streamable HTTP Server running on http://${HOST}:${PORT}`);
-    console.log(`Token: ${EXPECTED_TOKEN}`);
-    console.log(`Projects base dir: ${PROJECTS_BASE_DIR}`);
-    console.log(`MariaDB service override: ${DEVILBOX_MARIADB_SERVICE || '<auto>'}`);
-    console.log(`Postgres service override: ${DEVILBOX_POSTGRES_SERVICE || '<auto>'}`);
-    console.log(`Exec timeout: ${EXEC_TIMEOUT_MS > 0 ? `${EXEC_TIMEOUT_MS} ms` : 'disabled'}`);
+    logServer(`MCP Streamable HTTP Server running on http://${HOST}:${PORT}`);
+    logServer(`Token: ${EXPECTED_TOKEN}`);
+    logServer(`Projects base dir: ${PROJECTS_BASE_DIR}`);
+    logServer(`MariaDB service override: ${DEVILBOX_MARIADB_SERVICE || '<auto>'}`);
+    logServer(`Postgres service override: ${DEVILBOX_POSTGRES_SERVICE || '<auto>'}`);
+    logServer(`Exec timeout: ${EXEC_TIMEOUT_MS > 0 ? `${EXEC_TIMEOUT_MS} ms` : 'disabled'}`);
 });
 
 app.post(['/', '/mcp'], handleMcpRequest);
