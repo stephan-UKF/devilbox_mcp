@@ -130,10 +130,11 @@ Example MCP configuration for IDEs or clients that support streamable HTTP MCP w
 ```json
 {
   "mcpServers": {
-    "devilbox": {
-      "url": "http://127.0.0.1:8787/mcp",
+    "devilbox-php-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787",
       "headers": {
-        "Authorization": "Bearer replace_with_a_secure_token"
+        "Authorization": "Bearer your_token_goes_here"
       }
     }
   }
